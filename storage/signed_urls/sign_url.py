@@ -16,13 +16,49 @@
 
 from six.moves import urllib
 import argparse
-from oauth2client.client import GoogleCredentials
 import time
+import httplib2
+import base64
 
 
-def sign_string(credentials, s):
-    # TODO add IAM workaround, will raise NotImplementedError in GCE
-    return credentials.sign_blob(s)
+def sign_gae(b):
+    from oauth2client.contrib import appengine
+    creds = appengine.AppAssertionCredentials([])
+    return creds.service_account_email, creds.sign_blob(b)[1]
+
+
+def sign_from_file(filename, b):
+    from oauth2client.service_account import ServiceAccountCredentials
+    creds = ServiceAccountCredentials.from_json_keyfile_name(filename)
+    return creds.service_account_email, creds.sign_blob(b)[1]
+
+
+def sign_gce(b):
+    from googleapiclient.discovery import build
+    from oauth2client.contrib import gce
+
+    creds = gce.AppAssertionCredentials()
+    iam = build('iam', 'v1', credentials=creds)
+    resp = iam.projects().serviceAccounts().signBlob(
+        name="projects/{project_id}/serviceAccounts/{sa_email}".format(
+            project_id=_project_id_from_metadata(),
+            sa_email=creds.service_account_email
+        ),
+        body={
+            "bytesToSign": b
+        }
+    ).execute()
+    return creds.service_account_email, resp['signature']
+
+
+def _project_id_from_metadata():
+    http_request = httplib2.Http().request
+    response, content = http_request(
+        ('http://metadata.google.internal/computeMetadata/'
+         'v1/project/project-id'),
+        headers={'Metadata-Flavor': 'Google'}
+    )
+    return None, content.decode('utf-8')
 
 
 def make_signature_string(method,
@@ -36,7 +72,7 @@ def make_signature_string(method,
         method,
         content,
         content_type,
-        expiration,
+        str(expiration),
         extension_header_string,
         resource
     ])
@@ -60,7 +96,7 @@ def make_resource_string(parsed):
 def make_header_string(**custom_headers):
     return '\n'.join([
         ':'.join([header.lower(), value.lower()])
-        for header, value in custom_headers.iteritems().sort()
+        for header, value in sorted(custom_headers.items())
     ])
 
 
@@ -69,10 +105,9 @@ def main(url=None,
          content_file=None,
          content_type='',
          method='GET',
+         credentials=None,
          **kwargs):
     parsed = urllib.parse.urlparse(url)
-
-    credentials = GoogleCredentials.get_application_default()
 
     if content_file:
         with open(content_file, 'r') as content_f:
@@ -80,42 +115,57 @@ def main(url=None,
     else:
         content = ''
 
-    expiration = time.time() + duration
+    expiration = int(time.time() + duration)
 
     signature_string = make_signature_string(
         method,
         make_resource_string(parsed),
         expiration,
-        extension_header_stirng=make_header_string(**headers),
+        extension_header_string=make_header_string(**headers),
         content=content,
         content_type=content_type
     )
 
-    signed_string = sign_string(credentials, signature_string)
+    print(signature_string)
+
+    if credentials == 'gae':
+        email, signed_string = sign_gae(signature_string)
+    elif credentials == 'gce':
+        email, signed_string = sign_gce(signature_string)
+    else:
+        email, signed_string = sign_from_file(credentials, signature_string)
+
+    sig_bytes = base64.b64encode(signed_string)
 
     query_params = urllib.parse.parse_qs(parsed.query)
     query_params.update(
-        GoogleAccessId=credentials.email,
+        GoogleAccessId=email,
         Expires=expiration,
-        Signature=signed_string
+        Signature=sig_bytes
     )
-    new_query_string = urllib.parse.urlencode(query_params)
-    parsed[3] = new_query_string
+    url_tuple = list(parsed)
+    url_tuple[4] = urllib.parse.urlencode(query_params, doseq=True)
 
-    print(urllib.parse.urlunparse(parsed))
+    print(urllib.parse.urlunparse(url_tuple))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Arguments for signing a url')
-    parser.add_argument('url', required=True, help='A fully qualified url')
+    parser.add_argument('url', help='A fully qualified url')
     parser.add_argument(
         '--method',
         default='GET',
         help='HTTP Method for the request'
     )
+    parser.add_argument(
+        '--credentials',
+        required=True,
+        help="Either the string \"gae\" the string \"gce\" or a filename"
+    )
     parser.add_argument('--content-file', help='File name for request content')
     parser.add_argument(
         '--content-type',
+        default='',
         help='MIME type for the content'
     )
     parser.add_argument(
