@@ -1,1 +1,2 @@
 gcloud[grpc]==0.18.1
+google-cloud-happybase==0.19.0
